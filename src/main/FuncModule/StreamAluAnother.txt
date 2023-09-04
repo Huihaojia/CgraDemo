@@ -1,0 +1,452 @@
+package FuncModule
+
+import PE.Config
+import spinal.core._
+import spinal.sim._
+import spinal.core.sim._
+
+/**
+ * 这一版能用，问题在于对stall的优化不足，应该根据每个ALU Unit的状态动态产生，此外模块化设计理念体现不足，以后最好重新写一版
+ * OpcodeReg后续可以替换成FIFO减小时序
+ * ALU Unit后续可封装起来
+ */
+
+class StreamAlu(dataWidth: Int, fifoDepth: Int) extends Component {
+  val io = new Bundle {
+    val clk = in Bool()
+    val rst = in Bool()
+    val opcodeIn = in UInt(5 bits)
+    val dataIn1 = in UInt(dataWidth bits)
+    val dataIn2 = in UInt(dataWidth bits)
+    val stall = out Bool() simPublic()
+    val streamAluOutput = out UInt(dataWidth bits)
+    val streamAluValid = out Bool()
+  }
+
+  val stalls = Vec(Bool(), 3)
+  io.stall := stalls.reduceLeft(_ | _)
+
+  val streamAluClock = ClockDomain(
+    clock = io.clk,
+    reset = io.rst,
+    config = ClockDomainConfig(
+      clockEdge = RISING,
+      resetKind = ASYNC,
+      resetActiveLevel = LOW
+    )
+  )
+
+  val streamAluClockDomain = new ClockingArea(streamAluClock) {
+    val opEnable = Array.fill(4)(Bool())
+    opEnable.foreach(_ := False)
+    val opValid = io.opcodeIn =/= 0
+    val opValidReg = RegNextWhen(opValid, ~io.stall) init(False)
+    val opcodeReg = RegNextWhen(io.opcodeIn, ~io.stall) init(0)
+
+    val opcodeInterval = Reg(UInt(2 bits)) init(0)
+    val keepDirectFlag = Reg(Bool()) init(False)
+
+    val dataIn1Reg = RegNextWhen(io.dataIn1, ~io.stall) init (0)
+    val dataIn2Reg = RegNextWhen(io.dataIn2, ~io.stall) init (0)
+
+    val multiCycleDataValid = out Bool()
+    val singleCycleDataValid = out Bool()
+    val multiCycleDataOut = out UInt (dataWidth bits)
+    val singleCycleDataOut = out UInt (dataWidth bits)
+    val multiCycleDataAddress = out UInt(fifoDepth bits)
+    val multiCycleAddressValid = out Bool()
+
+    val multiOpRegState = Vec(Reg(Bool()) init (False), 4)
+    val multiOpReg = Vec(Reg(UInt(5 bits)) init (0), 4)
+    val singleOpReg = Reg(UInt(5 bits)) init (0)
+
+    /**
+     * Generate Reg & Multi Flag for FIFO
+     */
+    val regFlag = Reg(Bool()) init(False)
+    val multiFlag = Reg(Bool()) init(False)
+    val currentOpcodeType = io.opcodeIn(3 to 4)
+//    regFlag := opcodeInterval =/= 0
+    when(currentOpcodeType === 0) {
+      multiFlag := False
+    } otherwise {
+      multiFlag := True
+    }
+
+    /**
+     * 这里有一个状态机，初始状态所直接输出状态，来非0的opcode后切换到减法状态，若输入相等则依旧直接输出并切回直接输出，若输入大于interval
+     * 载入新的interval并保持该状态，若输入小于interval则做减法
+     *
+     * 这个逻辑去掉single和multi的区分可以直接拿来用作调度，只是insert压力有点大，把运算分成四类，
+     */
+    val equalInterval = opcodeInterval === io.opcodeIn(3 to 4)
+    val largerInterval =  opcodeInterval > io.opcodeIn(3 to 4)
+    when(~keepDirectFlag) {
+      opcodeInterval :=  io.opcodeIn(3 to 4)
+      regFlag := False
+      when(io.opcodeIn(3 to 4) =/= 0) {
+        keepDirectFlag := True
+      }
+    } otherwise {
+      when(largerInterval) {
+        opcodeInterval := opcodeInterval - io.opcodeIn(3 to 4)
+        keepDirectFlag := True
+        regFlag := True
+      } elsewhen(equalInterval) {
+        opcodeInterval := io.opcodeIn(3 to 4)
+        keepDirectFlag := False
+        regFlag := False
+      } otherwise {
+        opcodeInterval := io.opcodeIn(3 to 4)
+        keepDirectFlag := True
+        regFlag := False
+      }
+    }
+
+
+
+    /**
+     * Data FIFO
+     */
+    val dataFifo = new FIFO(dataWidth = dataWidth+1, depth = fifoDepth)
+    val dataOut = dataFifo.io.readData
+    dataFifo.io.clk := io.clk
+    dataFifo.io.rst := io.rst
+    dataFifo.io.writeEnable := regFlag
+    dataFifo.io.writeData := (singleCycleDataValid ## singleCycleDataOut).asUInt
+
+    /**
+     * Select Signal FIFO
+     */
+    //0 bit表示寄存器输出还是直接输出，1 bit表示single输出还算multi输出
+    val selSignalFifo = new FIFO(dataWidth = 2, depth = fifoDepth)
+    val inOrderSelSignal = selSignalFifo.io.readData
+    val selRegFlag = inOrderSelSignal(0)
+    val selMultiFlag = inOrderSelSignal(1)
+    selSignalFifo.io.clk := io.clk
+    selSignalFifo.io.rst := io.rst
+    selSignalFifo.io.writeEnable := opValidReg
+    selSignalFifo.io.writeData := (multiFlag ## regFlag).asUInt
+
+    selSignalFifo.io.insertAddr := 0
+    selSignalFifo.io.insertData := 0
+    selSignalFifo.io.insertEnable := False
+
+    /**
+     * Select Stream Alu Data & Valid Output
+     */
+    when(selRegFlag) {
+      dataFifo.io.readEnable := True
+      selSignalFifo.io.readEnable := dataFifo.io.readData.msb
+      when(selSignalFifo.io.readEnable) {
+        io.streamAluOutput := dataOut(0 until dataOut.high)
+        io.streamAluValid := dataOut.msb
+      } otherwise {
+        io.streamAluOutput := 0
+        io.streamAluValid := False
+      }
+    } otherwise {
+      dataFifo.io.readEnable := False
+      when(selMultiFlag) {
+        selSignalFifo.io.readEnable := multiCycleDataValid
+        when(selSignalFifo.io.readEnable) {
+          io.streamAluOutput := multiCycleDataOut
+          io.streamAluValid := multiCycleDataValid
+        } otherwise {
+          io.streamAluOutput := 0
+          io.streamAluValid := False
+        }
+      } otherwise {
+        selSignalFifo.io.readEnable := singleCycleDataValid
+        when(selSignalFifo.io.readEnable) {
+          io.streamAluOutput := singleCycleDataOut
+          io.streamAluValid := singleCycleDataValid
+        } otherwise {
+          io.streamAluOutput := 0
+          io.streamAluValid := False
+        }
+      }
+    }
+
+    /**
+     * Distribute Data Fifo Insert Address
+     */
+    val multiOpDataAddress = Vec(UInt(fifoDepth+1 bits), 3)
+    val insertOpDataAddress = Vec(UInt(fifoDepth+1 bits), 3)
+
+    for(i <- 0 until multiOpDataAddress.length) {
+      when(opcodeReg(3 to 4) === i+1) {
+        multiOpDataAddress(i) := (regFlag ## dataFifo.writeAddr).asUInt
+      } otherwise {
+        multiOpDataAddress(i) := 0
+      }
+    }
+
+    /**
+     * Insert Data to Data Fifo
+     */
+    when(multiCycleAddressValid) {
+      dataFifo.io.insertEnable := True
+      dataFifo.io.insertData := (multiCycleDataValid ## multiCycleDataOut).asUInt
+      dataFifo.io.insertAddr := multiCycleDataAddress
+    } otherwise {
+      dataFifo.io.insertEnable := False
+      dataFifo.io.insertData := 0
+      dataFifo.io.insertAddr := 0
+    }
+
+    /**
+     * Connect Opcode Register Select Units
+     */
+    val opcodeRegSel = Array.fill(3)(new OpcodeRegSelUnit())
+    for (i <- 0 until opcodeRegSel.length) {
+      opcodeRegSel(i).io.opEnable := opEnable(i+1)
+      if(i == opcodeRegSel.length-1) opcodeRegSel(i).io.lastFullState := False
+      else opcodeRegSel(i).io.lastFullState := multiOpRegState(i+2)
+    }
+    opcodeRegSel.head.io.opRegLastEnable := False
+    for ((i, s) <- (opcodeRegSel.dropRight(1), opcodeRegSel.tail).zipped) {
+      s.io.opRegLastEnable := i.io.opRegNextEnable
+    }
+
+    /**
+     * Input Opcode to Stream Register
+     */
+    for(i <- 0 until multiOpReg.length) {
+      if(i == multiOpReg.length-1) {
+        when(multiOpRegState(0) & ~multiCycleDataValid) {
+          multiOpReg(i) := multiOpReg(i)
+          multiOpRegState(i) := multiOpRegState(i)
+        } elsewhen (opcodeRegSel(i-1).io.opRegEnable) {
+          multiOpReg(i) := io.opcodeIn
+          multiOpRegState(i) := True
+        } otherwise {
+          multiOpReg(i) := 0
+          multiOpRegState(i) := False
+        }
+      } else if(i == 0){
+        //Here is Controlled By Stall
+        when(multiOpRegState(0) & ~multiCycleDataValid) {
+          multiOpReg(i) := multiOpReg(i)
+          multiOpRegState(i) := multiOpRegState(i)
+        } elsewhen(True) {
+          multiOpReg(i) := multiOpReg(i+1)
+          multiOpRegState(i) := multiOpRegState(i+1)
+        }
+      } else {
+        when(multiOpRegState(0) & ~multiCycleDataValid) {
+          multiOpReg(i) := multiOpReg(i)
+          multiOpRegState(i) := multiOpRegState(i)
+        } elsewhen (opcodeRegSel(i-1).io.opRegEnable) {
+          multiOpReg(i) := io.opcodeIn
+          multiOpRegState(i) := True
+        } otherwise {
+          multiOpReg(i) := multiOpReg(i+1)
+          multiOpRegState(i) := multiOpRegState(i+1)
+        }
+      }
+    }
+
+    /**
+     * Generate ALU Result and Opcode Type
+     */
+    when(opValid & io.opcodeIn(3 to 4) === 0) {
+      singleOpReg := io.opcodeIn
+      opEnable(0) := True
+    } otherwise {
+      singleOpReg := 0
+    }
+    switch(io.opcodeIn(3 to 4)) {
+      is(1) {
+        opEnable(1) := True
+      }
+      is(2) {
+        opEnable(2) := True
+      }
+      is(3) {
+        opEnable(3) := True
+      }
+    }
+
+    /**
+     * Generate Single Op Data Output
+     */
+    when(singleOpReg =/= 0) {
+      AluStyle.OneCycle(opValid, dataIn1Reg, dataIn2Reg, singleCycleDataOut, singleCycleDataValid)
+    } otherwise {
+      singleCycleDataOut := 0
+      singleCycleDataValid := False
+    }
+
+    /**
+     * Generate Multiple Op Data Output
+     */
+    val multiOpIn1 = Vec(UInt(dataWidth bits), 3)
+    val multiOpIn2 = Vec(UInt(dataWidth bits), 3)
+    val multiOpValid = Vec(Bool(), 3)
+    val multiOpOut = Vec(UInt(dataWidth bits), 3)
+    val multiOpDataValid = Vec(Bool(), 3)
+
+    for(i <- 0 until multiOpValid.length) {
+      when(opcodeReg(3 to 4) === i+1) {
+        multiOpIn1(i) := dataIn1Reg
+        multiOpIn2(i) := dataIn2Reg
+        multiOpValid(i) := opValidReg
+      } otherwise {
+        multiOpIn1(i) := 0
+        multiOpIn2(i) := 0
+        multiOpValid(i) := False
+      }
+    }
+
+    switch(multiOpReg(0)(3 to 4)) {
+      is(1) {
+        multiCycleDataOut := multiOpOut(0)
+        multiCycleDataValid := multiOpDataValid(0)
+        multiCycleDataAddress := insertOpDataAddress(0)(0 until fifoDepth)
+        multiCycleAddressValid := insertOpDataAddress(0).msb
+      }
+      is(2) {
+        multiCycleDataOut := multiOpOut(1)
+        multiCycleDataValid := multiOpDataValid(1)
+        multiCycleDataAddress := insertOpDataAddress(1)(0 until fifoDepth)
+        multiCycleAddressValid := insertOpDataAddress(1).msb
+      }
+      is(3) {
+        multiCycleDataOut := multiOpOut(2)
+        multiCycleDataValid := multiOpDataValid(2)
+        multiCycleDataAddress := insertOpDataAddress(2)(0 until fifoDepth)
+        multiCycleAddressValid := insertOpDataAddress(2).msb
+      }
+      default {
+        multiCycleDataOut := 0
+        multiCycleDataValid := False
+        multiCycleDataAddress := 0
+        multiCycleAddressValid := False
+      }
+    }
+
+    val multiOpReady = Vec(Bool(), 3)
+    for (i <- 0 until multiOpReady.length) {
+      when(multiOpReg(0)(3 to 4) === i+1) {
+        multiOpReady(i) := multiOpRegState(0)
+      } otherwise {
+        multiOpReady(i) := False
+      }
+    }
+    AluStyle.TwoCycle(multiOpReady(0), multiOpValid(0), multiOpIn1(0), multiOpIn2(0), multiOpOut(0), multiOpDataValid(0), stalls(0), multiOpDataAddress(0), insertOpDataAddress(0))
+    AluStyle.ThreeCycle(multiOpReady(1), multiOpValid(1), multiOpIn1(1), multiOpIn2(1), multiOpOut(1), multiOpDataValid(1), stalls(1), multiOpDataAddress(1), insertOpDataAddress(1))
+    AluStyle.FourCycle(multiOpReady(2), multiOpValid(2), multiOpIn1(2), multiOpIn2(2), multiOpOut(2), multiOpDataValid(2), stalls(2), multiOpDataAddress(2), insertOpDataAddress(2))
+  }
+  streamAluClockDomain.setName("SA")
+}
+
+//class MultiCycleAluUnit(stageNum: Int)
+
+object AluStyle {
+  def OneCycle(opEn: Bool, in1: UInt, in2: UInt, out: UInt, valid: Bool): Unit = {
+    out := in1 + in2
+    valid := opEn
+  }
+
+  def TwoCycle(ready: Bool, opEn: Bool, in1: UInt, in2: UInt, out: UInt, valid: Bool, stall: Bool, addrIn: UInt, addrOut: UInt): Unit = {
+    val midReg = Reg(UInt(out.getWidth bits)) init(0)
+    val midValidReg = Reg(Bool()) init(False)
+    val midAddrReg = Reg(UInt(addrIn.getWidth bits)) init(0)
+    midReg.setName("twoCycle_midReg")
+    midValidReg.setName("twoCycle_midValid")
+    midAddrReg.setName("twoCycle_midAddrReg")
+    midReg := in1 + in2
+    midValidReg := opEn
+    midAddrReg := addrIn
+    out := (midReg << 4).resized
+    valid := midValidReg
+    when(~ready & valid) {
+      midReg := midReg
+    }
+    stall := ~ready & valid
+    when(stall) {
+      midValidReg := midValidReg
+    }
+    addrOut := midAddrReg
+  }
+
+  def ThreeCycle(ready: Bool, opEn: Bool, in1: UInt, in2: UInt, out: UInt, valid: Bool, stall: Bool, addrIn: UInt, addrOut: UInt): Unit = {
+    val midReg = Vec(Reg(UInt(out.getWidth bits)) init (0), 2)
+    val midValidReg = Vec(Reg(Bool()) init(False), 2)
+    val midAddrReg = Vec(Reg(UInt(addrIn.getWidth bits)) init(0), 2)
+    midReg.setName("threeCycle_midReg")
+    midValidReg.setName("threeCycle_midValid")
+    midAddrReg.setName("twoCycle_midAddrReg")
+    midReg(0) := in1 + in2
+    midReg(1) := (midReg(0) <<4).resized
+    midValidReg(0) := opEn
+    midValidReg(1) := midValidReg(0)
+    midAddrReg(0) := addrIn
+    midAddrReg(1) := midAddrReg(0)
+    out := (midReg(1) << 4).resized
+    valid := midValidReg(1)
+    midReg.foreach{s =>
+      when(~ready & valid) {
+        s := s
+      }
+    }
+    stall := ~ready & valid
+    midValidReg.foreach { s =>
+      when(stall) {
+        s := s
+      }
+    }
+    addrOut := midAddrReg(1)
+  }
+
+  def FourCycle(ready: Bool, opEn: Bool, in1: UInt, in2: UInt, out: UInt, valid: Bool, stall: Bool, addrIn: UInt, addrOut: UInt): Unit = {
+    val midReg = Vec(Reg(UInt(out.getWidth bits)) init (0), 3)
+    val midValidReg = Vec(Reg(Bool()) init(False), 3)
+    val midAddrReg = Vec(Reg(UInt(addrIn.getWidth bits)) init(0), 3)
+    midReg.setName("fourCycle_midReg")
+    midValidReg.setName("fourCycle_midValid")
+    midAddrReg.setName("twoCycle_midAddrReg")
+    midReg(0) := in1 + in2
+    midReg(1) := (midReg(0) << 4).resized
+    midReg(2) := (midReg(1) << 4).resized
+    midValidReg(0) := opEn
+    midValidReg(1) := midValidReg(0)
+    midValidReg(2) := midValidReg(1)
+    midAddrReg(0) := addrIn
+    midAddrReg(1) := midAddrReg(0)
+    midAddrReg(2) := midAddrReg(1)
+    out := (midReg(2) << 4).resized
+    valid := midValidReg(2)
+    midReg.foreach { s =>
+      when(~ready & valid) {
+        s := s
+      }
+    }
+    stall := ~ready & valid
+    midValidReg.foreach { s =>
+      when(stall) {
+        s := s
+      }
+    }
+    addrOut := midAddrReg(2)
+  }
+}
+
+class OpcodeRegSelUnit extends Component {
+  val io = new Bundle {
+    val opEnable = in Bool()
+    val lastFullState = in Bool()
+    val opRegLastEnable = in Bool()
+    val opRegEnable = out Bool()
+    val opRegNextEnable = out Bool()
+  }
+  val opValid = Bool()
+  opValid := (io.opEnable | io.opRegLastEnable)
+  io.opRegEnable := opValid & ~io.lastFullState
+  io.opRegNextEnable := opValid & io.lastFullState
+}
+
+object StreamAluVerilog extends App {
+  Config.spinal.generateVerilog(new StreamAlu(32, 4))
+}

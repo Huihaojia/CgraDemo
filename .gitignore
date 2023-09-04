@@ -1,0 +1,17 @@
+tmp/
+simWorkspace/
+**/tb/
+*.log
+*.bak
+
+# sbt specific
+.cache/
+.history/
+.lib/
+dist/*
+target/
+project/project
+
+# Metals
+.metals
+project/metals.sbt
